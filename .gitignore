@@ -1,0 +1,29 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local credentials, configuration, and runtime state
+.env
+.env.*
+*.key
+*.pem
+*keys*.json
+*config*.json
+*state*.json
+*.log
+
+# WeChat databases and decrypted/exported private data
+*.db
+*.db-shm
+*.db-wal
+decrypted/
+exports/
+vault/
+data/
+output/
+
+# Temporary signed application copies and macOS signing artifacts
+*.app/
+*.entitlements
+*.plist

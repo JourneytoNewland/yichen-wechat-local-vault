@@ -1,0 +1,3 @@
+-r requirements.txt
+frida>=16,<18
+frida-tools>=13,<15

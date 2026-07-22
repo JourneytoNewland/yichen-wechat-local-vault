@@ -1,0 +1,7 @@
+interface:
+  display_name: "微信本地数据 Vault"
+  short_description: "本地查询微信会话、聊天、未读、收藏和统计分析"
+  default_prompt: "Use $yichen-wechat-local-vault to review my local WeChat activity and produce a privacy-conscious action list."
+
+policy:
+  allow_implicit_invocation: true
