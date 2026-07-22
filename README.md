@@ -1,6 +1,6 @@
 # yichen-wechat-local-vault
 
-老王注：原 Skill 来源：https://github.com/mcncarl/yichen-skills，直接运行不行，取不到数据！用 Codex 半小时硬解（用 Clauded Code 改了三个小时硬是没有改出来，哈哈）至少本机 Mac/Apple M5/Tahoe 26.0/微信版本 4.1.2.241 经测试可正常运行。
+老王注：原 Skill 来源：https://github.com/mcncarl/yichen-skills ，直接运行不行，取不到数据！用 Codex 半小时硬解（用 Clauded Code 改了三个小时硬是没有改出来，哈哈）至少本机 Mac/Apple M5/Tahoe 26.0/微信版本 4.1.2.241 经测试可正常运行。
 
 面向 Claude Code 与 Codex 的 macOS 微信本地数据查询、导出和分析 Skill。默认只读，日常查询基于固定提交版本的 [`wechat-cli`](https://github.com/huohuoer/wechat-cli)。
 
