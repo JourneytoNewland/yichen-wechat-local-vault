@@ -17,7 +17,8 @@ FORBIDDEN_NAMES = {
     "hook_commoncrypto.py",
     "hook_commoncrypto_v2.py",
 }
-PRIVATE_SUFFIXES = {".db", ".key", ".pem", ".pyc"}
+PRIVATE_SUFFIXES = {".db", ".key", ".pem", ".pyc", ".sqlite", ".sqlite3", ".log"}
+PRIVATE_NAME = re.compile(r"(?:\.db-(?:wal|shm|journal)|\.sqlite-(?:wal|shm)|^\.wechat-keys-|(?:keys|config|state).*\.json$)", re.I)
 MAX_PUBLIC_FILE_BYTES = 2 * 1024 * 1024
 
 # Build markers in pieces so this checker does not flag its own source text.
@@ -47,6 +48,8 @@ def main() -> int:
             findings.append(f"forbidden file: {rel}")
         if path.suffix.lower() in PRIVATE_SUFFIXES:
             findings.append(f"private/generated file type: {rel}")
+        if PRIVATE_NAME.search(path.name):
+            findings.append(f"private runtime file name: {rel}")
         if path.stat().st_size > MAX_PUBLIC_FILE_BYTES:
             findings.append(f"oversized file ({path.stat().st_size} bytes): {rel}")
         try:

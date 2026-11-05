@@ -9,6 +9,7 @@ __pycache__/
 *.key
 *.pem
 *keys*.json
+.wechat-keys-*
 *config*.json
 *state*.json
 *.log
@@ -17,6 +18,11 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
 decrypted/
 exports/
 vault/

@@ -10,12 +10,11 @@ SQLCipher PBKDF2 outputs, and matches them to local database salts.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
+import stat
 import hashlib
 import hmac as hmac_mod
-import shutil
 import struct
 import subprocess
 import sys
@@ -24,15 +23,8 @@ import textwrap
 import time
 from pathlib import Path
 
-KEYS_FILE = Path("~/.config/wechat-keys.json").expanduser()
-CONFIG_FILE = Path("~/.config/wechat-local-vault.json").expanduser()
 WECHAT_APP = Path("/Applications/WeChat.app")
-WECHAT_COPY = Path("~/Desktop/WeChat.app").expanduser()
-FRIDA_LOG = Path("/tmp/wechat_frida_keys.log")
-DEFAULT_VAULT_DIR = Path("~/Library/Application Support/wechat-local-vault").expanduser()
-WECHAT_BASE = Path(
-    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
-).expanduser()
+WECHAT_COPY = Path("/nonexistent/private-wechat-copy/WeChat.app")
 
 PAGE_SIZE = 4096
 RESERVE = 80
@@ -66,7 +58,10 @@ def _mac_key(enc_key: bytes, salt: bytes) -> bytes:
 
 def try_decrypt_page(db_path: str, key_hex: str) -> bool:
     """Verify a candidate encryption key using SQLCipher 4 HMAC-SHA512 on page 1."""
-    key = bytes.fromhex(key_hex)
+    try:
+        key = bytes.fromhex(key_hex)
+    except (TypeError, ValueError):
+        return False
     if len(key) != KEY_SIZE:
         return False
     try:
@@ -76,7 +71,7 @@ def try_decrypt_page(db_path: str, key_hex: str) -> bool:
             return False
 
         salt = page[:SALT_SIZE]
-        enc_data = page[SALT_SIZE : PAGE_SIZE - RESERVE]
+        enc_data = page[SALT_SIZE : PAGE_SIZE - RESERVE + IV_SIZE]
         stored_hmac = page[PAGE_SIZE - RESERVE + IV_SIZE : PAGE_SIZE - RESERVE + IV_SIZE + 64]
 
         mac_key = _mac_key(key, salt)
@@ -90,7 +85,6 @@ def try_decrypt_page(db_path: str, key_hex: str) -> bool:
 FRIDA_JS = r"""
 'use strict';
 
-const LOG_PATH = '___LOG_PATH___';
 const TARGET_SALTS = ___TARGET_SALTS___;
 const seen = {};
 let hookInstalled = false;
@@ -110,17 +104,6 @@ function hexFromPointer(ptr, len, maxLen) {
     return out;
   } catch (e) {
     return null;
-  }
-}
-
-function appendJsonLine(obj) {
-  try {
-    const f = new File(LOG_PATH, 'a');
-    f.write(JSON.stringify(obj) + '\n');
-    f.flush();
-    f.close();
-  } catch (e) {
-    send({ type: 'error', msg: 'log write failed: ' + e });
   }
 }
 
@@ -169,7 +152,6 @@ function installHookAt(address, owner) {
         dk: dkHex,
         ts: Date.now()
       };
-      appendJsonLine(item);
       send({ type: 'pbkdf2', data: item });
     }
   });
@@ -214,82 +196,6 @@ installLoop();
 """
 
 
-FRIDA_HOST = r"""
-import frida
-import json
-import os
-import sys
-import time
-
-MODE = "___MODE___"
-WECHAT_PATH = "___WECHAT_PATH___"
-ATTACH_PID = ___ATTACH_PID___
-DURATION = ___DURATION___
-LOG_FILE = "___LOG_FILE___"
-JS_CODE = ___JS_CODE_JSON___
-
-keys = []
-
-def on_message(message, data):
-    if message.get("type") == "send":
-        payload = message.get("payload", {})
-        if payload.get("type") == "pbkdf2":
-            item = payload["data"]
-            keys.append(item)
-            print(
-                f"  [PBKDF2] rounds={item.get('rounds')} "
-                f"key material captured (redacted), len={item.get('dk_len')}"
-            )
-        elif payload.get("type") == "status":
-            print(f"  {payload.get('msg')}")
-        elif payload.get("type") == "error":
-            print(f"  [FRIDA ERROR] {payload.get('msg')}")
-        else:
-            print(f"  [FRIDA] {payload}")
-    elif message.get("type") == "error":
-        print(f"  [FRIDA ERROR] {message.get('description', message)}")
-
-device = frida.get_local_device()
-
-if MODE == "spawn":
-    print("  Spawning signed WeChat copy...")
-    pid = device.spawn([WECHAT_PATH])
-    session = device.attach(pid)
-else:
-    print("  Attaching to running signed WeChat copy...")
-    if ATTACH_PID <= 0:
-        raise SystemExit("No running signed WeChat copy found. Start the signed copy first.")
-    pid = ATTACH_PID
-    session = device.attach(pid)
-
-script = session.create_script(JS_CODE)
-script.on("message", on_message)
-script.load()
-
-if MODE == "spawn":
-    device.resume(pid)
-
-print("")
-print("  Keep this process running, then in WeChat:")
-print("    1. Confirm you are logged in.")
-print("    2. Open Favorites/收藏.")
-print("    3. Open Moments/朋友圈 and scroll once.")
-print("  Capturing for %d seconds. Log: %s" % (DURATION, LOG_FILE))
-print("")
-
-try:
-    for remaining in range(DURATION, 0, -1):
-        time.sleep(1)
-        if remaining % 15 == 0:
-            print(f"  Remaining {remaining}s, captured {len(keys)} PBKDF2 calls...")
-except KeyboardInterrupt:
-    print("\n  Interrupted; keeping captured calls.")
-finally:
-    session.detach()
-    print(f"\n  Captured {len(keys)} PBKDF2 calls.")
-"""
-
-
 def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
     result = subprocess.run(cmd, capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -300,27 +206,6 @@ def run_cmd(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
             print(result.stderr.strip())
         sys.exit(1)
     return result
-
-
-def load_json(path: Path) -> dict:
-    if not path.exists():
-        return {}
-    with path.open() as f:
-        return json.load(f)
-
-
-def load_config() -> dict:
-    return load_json(CONFIG_FILE)
-
-
-def save_json(path: Path, data: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def check_env() -> None:
@@ -346,39 +231,26 @@ def check_env() -> None:
 
 
 def prepare_wechat(copy_path: Path, skip_prepare: bool) -> None:
-    print("\n[2/5] Preparing signed WeChat copy...")
-    if skip_prepare:
-        print(f"  Skipped. Using {copy_path}")
-        return
-    if not copy_path.exists():
-        print(f"  Copying {WECHAT_APP} -> {copy_path}")
-        if copy_path.parent:
-            copy_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(WECHAT_APP, copy_path, symlinks=True)
-    else:
-        print(f"  Existing copy: {copy_path}")
-    print("  Ad-hoc signing the copy...")
-    run_cmd(["codesign", "--force", "--deep", "--sign", "-", str(copy_path)])
-    print("  OK signed copy is ready")
-
-
-def find_db_base(preferred: str | None = None) -> tuple[str, Path]:
-    if preferred:
-        db_base = Path(preferred).expanduser()
-        wxid = db_base.parts[-2] if db_base.name == "db_storage" else db_base.name
-        return wxid, db_base
-
-    config = load_config()
-    if config.get("db_base_path"):
-        db_base = Path(config["db_base_path"]).expanduser()
-        wxid = config.get("wxid") or db_base.parts[-2]
-        return wxid, db_base
-
-    dirs = sorted(glob.glob(str(WECHAT_BASE / "*/db_storage")))
-    if not dirs:
-        raise SystemExit(f"No WeChat db_storage directory found under {WECHAT_BASE}")
-    db_base = Path(dirs[0])
-    return db_base.parts[-2], db_base
+    print("\n[2/5] Validating signed WeChat copy...")
+    resolved = copy_path.resolve()
+    original = WECHAT_APP.resolve()
+    if resolved == original or original in resolved.parents:
+        raise SystemExit("Refusing to use the original WeChat application.")
+    if not skip_prepare:
+        raise SystemExit("Automatic copying and signing are disabled; prepare a private temporary copy first.")
+    temp_roots = {Path(tempfile.gettempdir()).resolve(), Path('/private/tmp').resolve()}
+    parent = copy_path.parent
+    if (parent.resolve().parent not in temp_roots or not parent.name.startswith('wechat-')
+            or parent.is_symlink() or copy_path.is_symlink() or not copy_path.is_dir()):
+        raise SystemExit("The copy must be in a dedicated private temporary directory.")
+    info = parent.stat()
+    if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise SystemExit("Temporary directory must be owned by the user and private (0700).")
+    binary = copy_path / 'Contents/MacOS/WeChat'
+    if binary.is_symlink() or not binary.is_file() or resolved not in binary.resolve().parents:
+        raise SystemExit("Invalid application binary in the temporary copy.")
+    run_cmd(["codesign", "--verify", "--deep", "--strict", str(copy_path)])
+    print("  OK private temporary copy signature verified")
 
 
 def collect_db_info(db_base: Path) -> dict[str, dict[str, str]]:
@@ -441,113 +313,51 @@ def run_frida_capture(
     copy_path: Path,
     target_salts: list[str],
     reset_log: bool,
-) -> None:
+) -> list[dict]:
     print("\n[4/5] Capturing PBKDF2 calls with frida...")
-    if reset_log and FRIDA_LOG.exists():
-        FRIDA_LOG.unlink()
-
+    if not reset_log:
+        raise SystemExit("Reusing sensitive capture logs is disabled.")
     wechat_binary = copy_path / "Contents/MacOS/WeChat"
     if not wechat_binary.exists():
         raise SystemExit(f"WeChat executable not found: {wechat_binary}")
-    attach_pid = find_running_process(str(wechat_binary)) if mode == "attach" else 0
+    if mode != "spawn":
+        raise SystemExit("Attach mode is disabled.")
 
     js_code = (
         FRIDA_JS
-        .replace("___LOG_PATH___", str(FRIDA_LOG))
         .replace("___TARGET_SALTS___", json.dumps(target_salts))
     )
-    host = (
-        FRIDA_HOST
-        .replace("___MODE___", mode)
-        .replace("___WECHAT_PATH___", str(wechat_binary))
-        .replace("___ATTACH_PID___", str(attach_pid))
-        .replace("___DURATION___", str(duration))
-        .replace("___LOG_FILE___", str(FRIDA_LOG))
-        .replace("___JS_CODE_JSON___", json.dumps(js_code))
-    )
+    import frida
+    captured = []
+    def on_message(message, _data):
+        if message.get("type") == "send":
+            payload = message.get("payload", {})
+            if payload.get("type") == "pbkdf2":
+                captured.append(payload.get("data", {}))
+        elif message.get("type") == "error":
+            print("  [FRIDA ERROR] Capture script failed; details withheld.", file=sys.stderr)
 
-    with tempfile.NamedTemporaryFile("w", suffix="_wechat_frida_host.py", delete=False) as f:
-        f.write(host)
-        host_path = f.name
-
+    device = frida.get_local_device()
+    session = None
+    pid = None
+    resumed = False
     try:
-        subprocess.run([sys.executable, host_path], check=True)
-    except subprocess.CalledProcessError as exc:
-        raise SystemExit(f"frida host failed with exit code {exc.returncode}") from exc
+        pid = device.spawn([str(wechat_binary)], stdio="pipe")
+        session = device.attach(pid)
+        script = session.create_script(js_code)
+        script.on("message", on_message)
+        script.load()
+        if mode == "spawn":
+            device.resume(pid)
+            resumed = True
+        print(f"  Capture active for up to {duration} seconds; key material remains in memory.")
+        time.sleep(duration)
     finally:
-        try:
-            os.unlink(host_path)
-        except OSError:
-            pass
-
-
-def find_running_process(executable_path: str) -> int:
-    result = run_cmd(["pgrep", "-f", executable_path], check=False)
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            return int(line)
-    return 0
-
-
-def read_captured_pbkdf2() -> list[dict]:
-    if not FRIDA_LOG.exists():
-        return []
-    rows = []
-    with FRIDA_LOG.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                item = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if item.get("type") == "pbkdf2" and item.get("dk"):
-                rows.append(item)
-    return rows
-
-
-def try_decrypt_page(db_path: str, key_hex: str) -> bool:
-    import struct
-    from Crypto.Cipher import AES
-
-    try:
-        key = bytes.fromhex(key_hex)
-        if len(key) != 32:
-            return False
-        with open(db_path, "rb") as f:
-            page = f.read(PAGE_SIZE)
-        if len(page) < PAGE_SIZE:
-            return False
-
-        enc_start = 16
-        enc_size = PAGE_SIZE - RESERVE - enc_start
-        iv = page[PAGE_SIZE - RESERVE:PAGE_SIZE - RESERVE + IV_SIZE]
-        dec = AES.new(key, AES.MODE_CBC, iv).decrypt(page[enc_start:enc_start + enc_size])
-
-        rebuilt = bytearray(PAGE_SIZE)
-        rebuilt[:16] = b"SQLite format 3\x00"
-        rebuilt[16:16 + len(dec)] = dec
-
-        page_size = struct.unpack(">H", rebuilt[16:18])[0]
-        write_version = rebuilt[18]
-        read_version = rebuilt[19]
-        reserved = rebuilt[20]
-        max_payload = rebuilt[21]
-        min_payload = rebuilt[22]
-        leaf_payload = rebuilt[23]
-        return (
-            page_size == PAGE_SIZE
-            and write_version in (1, 2)
-            and read_version in (1, 2)
-            and reserved == RESERVE
-            and max_payload == 64
-            and min_payload == 32
-            and leaf_payload == 32
-        )
-    except Exception:
-        return False
+        if session is not None:
+            session.detach()
+        if mode == "spawn" and pid is not None and not resumed:
+            device.kill(pid)
+    return captured
 
 
 def match_keys(
@@ -639,15 +449,44 @@ def match_keys(
     return result
 
 
-def update_config(wxid: str, db_base: Path) -> None:
-    config = load_config()
-    config["wxid"] = wxid
-    config["db_base_path"] = str(db_base)
-    config.setdefault("vault_dir", str(DEFAULT_VAULT_DIR))
-    config.setdefault("decrypted_dir", str(DEFAULT_VAULT_DIR / "decrypted/current"))
-    config.setdefault("exports_dir", "~/Documents/wechat-local-vault/exports")
-    save_json(CONFIG_FILE, config)
-    print(f"  Updated config: {CONFIG_FILE}")
+def merge_cli_keys(db_base: Path, db_info: dict, matched: dict, targets: list[str], cfg: dict) -> None:
+    """Publish validated keys atomically, retaining a private pre-change backup."""
+    if db_base.resolve() != Path(cfg["db_dir"]).resolve():
+        raise ValueError("capture and CLI use different accounts")
+    key_path = Path(cfg["keys_file"])
+    if key_path.is_symlink() or not stat.S_ISREG(key_path.stat().st_mode):
+        raise ValueError("CLI key configuration must be a regular file")
+    with key_path.open(encoding="utf-8") as stream:
+        previous = json.load(stream)
+    if not isinstance(previous, dict):
+        raise ValueError("invalid CLI key configuration")
+    merged = dict(previous)
+    for name in targets:
+        item = db_info[name]
+        path = Path(item["path"]).resolve()
+        relative = path.relative_to(db_base.resolve()).as_posix()
+        key = matched.get(name)
+        if not key or not try_decrypt_page(str(path), key):
+            raise ValueError("refusing unverified key")
+        merged[relative] = {**merged.get(relative, {}), "enc_key": key}
+    if merged == previous:
+        return
+    staged = []
+    try:
+        for label, content in (("backup", previous), ("new", merged)):
+            fd, filename = tempfile.mkstemp(prefix=".wechat-keys-" + label + "-", dir=key_path.parent)
+            staged.append(Path(filename))
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(content, stream, ensure_ascii=False, indent=2)
+                stream.flush()
+                os.fsync(stream.fileno())
+        backup, new = staged
+        os.replace(new, key_path)
+        staged.remove(new)
+        staged.remove(backup)  # retain the 0600 backup for recovery
+    finally:
+        for path in staged:
+            path.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -656,11 +495,8 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent(
             """
-            Typical runs:
-              python3 extract_keys.py --targets sns,favorite --duration 120
-              python3 extract_keys.py --mode attach --targets sns,favorite --duration 90 --skip-prepare
-
-            During capture, open Favorites/收藏 and Moments/朋友圈 in the signed WeChat copy.
+            Requires a pre-approved, signed copy in a private temporary directory.
+            See SKILL.md for safety and compatibility limitations.
             """
         ),
     )
@@ -670,22 +506,33 @@ def main() -> None:
     parser.add_argument("--db-base", default=None)
     parser.add_argument("--wechat-copy", default=str(WECHAT_COPY))
     parser.add_argument("--skip-prepare", action="store_true")
-    parser.add_argument("--reuse-log", action="store_true", help="Do not delete /tmp/wechat_frida_keys.log before capture.")
+    parser.add_argument("--reuse-log", action="store_true", help="Disabled for security.")
     parser.add_argument("--list-dbs", action="store_true", help="Only print detected database salts.")
-    parser.add_argument("--match-only", action="store_true", help="Only match keys from the existing frida log.")
-    parser.add_argument("--show-sensitive", action="store_true", help="Show salts/key-adjacent identifiers in terminal output.")
+    parser.add_argument("--match-only", action="store_true", help="Disabled for security.")
+    parser.add_argument("--show-sensitive", action="store_true", help="Disabled for security.")
     args = parser.parse_args()
+
+    if args.mode != "spawn":
+        raise SystemExit("Attach mode is disabled; only a private temporary copy can be spawned.")
+    if args.show_sensitive:
+        raise SystemExit("Sensitive diagnostic output is disabled.")
+    if not 1 <= args.duration <= 600:
+        raise SystemExit("Capture duration must be between 1 and 600 seconds.")
 
     print("=" * 64)
     print("WeChat Mac 4.x database key extractor")
     print("=" * 64)
 
     check_env()
-    wxid, db_base = find_db_base(args.db_base)
+    from wechat_cli.core.config import load_config as load_cli_config
+    cli_cfg = load_cli_config()
+    cli_db_base = Path(cli_cfg["db_dir"]).resolve()
+    if args.db_base and Path(args.db_base).expanduser().resolve() != cli_db_base:
+        raise SystemExit("Capture database differs from the configured wechat-cli account.")
+    db_base = cli_db_base
     db_info = collect_db_info(db_base)
-    print(f"  wxid: {wxid if args.show_sensitive else '[redacted]'}")
-    print(f"  db_base: {db_base}")
-    print_db_info(db_info, show_sensitive=args.show_sensitive)
+    print("  db_base: [redacted]")
+    print_db_info(db_info, show_sensitive=False)
 
     if args.list_dbs:
         return
@@ -694,9 +541,11 @@ def main() -> None:
     target_salts = [db_info[name]["salt"] for name in targets if name in db_info]
 
     copy_path = Path(args.wechat_copy).expanduser()
+    if args.match_only or args.reuse_log:
+        raise SystemExit("Reading or reusing sensitive capture logs is disabled.")
     if not args.match_only:
         prepare_wechat(copy_path, args.skip_prepare)
-        run_frida_capture(
+        captured = run_frida_capture(
             mode=args.mode,
             duration=args.duration,
             copy_path=copy_path,
@@ -704,12 +553,8 @@ def main() -> None:
             reset_log=not args.reuse_log,
         )
 
-    captured = read_captured_pbkdf2()
-    existing = load_json(KEYS_FILE)
-    matched = match_keys(db_info, captured, existing, targets)
-
-    save_json(KEYS_FILE, matched)
-    update_config(wxid, db_base)
+    # Never mix keys from the legacy vault, which may point to another account.
+    matched = match_keys(db_info, captured, {}, targets)
 
     missing = [
         name
@@ -727,11 +572,11 @@ def main() -> None:
                 print(f"  - {name}: salt={salt}")
             else:
                 print(f"  - {name}")
-        print("\nRun again while opening those WeChat pages in the signed copy:")
-        print(f"  python3 {Path(__file__).resolve()} --mode attach --targets {','.join(missing)} --duration 120 --skip-prepare --reuse-log")
+        print("\nNo configuration was changed. Review the capture prerequisites before retrying.")
         raise SystemExit(2)
     else:
-        print(f"Done. Keys saved to {KEYS_FILE}")
+        merge_cli_keys(db_base, db_info, matched, targets, cli_cfg)
+        print("Done. Verified keys saved to the private wechat-cli configuration.")
     print("=" * 64)
 
 

@@ -65,9 +65,14 @@ def doctor() -> int:
     python = venv_python()
     print(f"venv: {'ok' if python.exists() else 'missing'} ({python})")
     if python.exists():
-        print(f"core_dependencies: {'ok' if modules_available(python, False) else 'missing'}")
+        core_ok = modules_available(python, False)
+        print(f"core_dependencies: {'ok' if core_ok else 'missing'}")
         print(f"capture_dependencies: {'ok' if modules_available(python, True) else 'missing'}")
-    return 0
+        if core_ok:
+            result = subprocess.run([str(python), str(ROOT / "scripts" / "wechat_guard.py"), "--coverage"], capture_output=True, text=True)
+            print(f"message_shard_coverage: {result.stdout.strip() or 'unavailable'}")
+            return result.returncode
+    return 3
 
 
 def main() -> int:
@@ -85,8 +90,10 @@ def main() -> int:
     if ns.command == "wechat" and ns.args[:1] == ["init"]:
         parser.error(
             "'wechat init' is disabled because the pinned upstream version may re-sign "
-            "/Applications/WeChat.app in place; use the opt-in 'scan' fallback instead"
+            "/Applications/WeChat.app in place; see the skill's capture safety guidance"
         )
+    if ns.command == "scan":
+        parser.error("'scan' is disabled pending security repair: it can expose key material")
     if ns.command in INVASIVE_COMMANDS and not ns.allow_invasive_capture:
         parser.error(
             f"'{ns.command}' reads WeChat process memory and may create/re-sign a temporary app copy; "
@@ -99,7 +106,7 @@ def main() -> int:
         return 0
     script_name = COMMANDS[ns.command]
     if script_name is None:
-        return subprocess.run([str(python), "-m", "wechat_cli.main", *ns.args]).returncode
+        return subprocess.run([str(python), str(ROOT / "scripts" / "wechat_guard.py"), *ns.args]).returncode
     script = ROOT / "scripts" / script_name
     return subprocess.run([str(python), str(script), *ns.args]).returncode
 
